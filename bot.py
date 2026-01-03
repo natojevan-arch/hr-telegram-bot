@@ -1,7 +1,7 @@
 import os
 import json
 import logging
-from typing import List
+from typing import List, Dict, Any
 
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.filters import Command, CommandStart
@@ -31,10 +31,8 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
     raise RuntimeError("Не задано BOT_TOKEN у змінних середовища (Render -> Environment).")
 
-# Рекомендується задати в Render. Якщо 0 — можна /setadmin (тимчасово, до перезапуску/деплою)
 ADMIN_CHAT_ID_ENV = os.getenv("ADMIN_CHAT_ID", "0").strip()
-
-CONFIG_FILE = "config.json"  # допоміжно, якщо ENV=0 (на Render може не зберігатися після деплою)
+CONFIG_FILE = "config.json"  # якщо ENV=0 (на Render краще все одно задати ENV)
 
 
 def load_admin_chat_id() -> int:
@@ -74,14 +72,44 @@ class Form(StatesGroup):
     name = State()
     contact = State()
     experience = State()
-    qa = State()
-    portfolio = State()
+    qa = State()          # питання 1..5 з кнопками
+    portfolio = State()   # фото/посилання
     schedule = State()
     start_ready = State()
 
 
 # -------------------------
-# КЛАВІАТУРИ
+# БОТ / DP / ROUTER
+# -------------------------
+router = Router()
+bot = Bot(BOT_TOKEN)  # без parse_mode — щоб не було помилок форматування
+dp = Dispatcher(storage=MemoryStorage())
+dp.include_router(router)
+
+
+async def safe_answer(message: Message, text: str, **kwargs):
+    try:
+        await message.answer(text, **kwargs)
+    except Exception as e:
+        log.exception("Помилка відправки повідомлення: %s", e)
+
+
+def kb_from_options(options: List[str], cols: int = 2) -> ReplyKeyboardMarkup:
+    """Робить клавіатуру з варіантів (по 2 кнопки в ряд)"""
+    rows = []
+    row = []
+    for opt in options:
+        row.append(KeyboardButton(text=opt))
+        if len(row) >= cols:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, one_time_keyboard=True)
+
+
+# -------------------------
+# КЛАВІАТУРИ (сталі)
 # -------------------------
 YES_KB = ReplyKeyboardMarkup(
     keyboard=[[KeyboardButton(text="Погоджуюсь")]],
@@ -100,56 +128,91 @@ ROLE_KB = ReplyKeyboardMarkup(
     one_time_keyboard=True,
 )
 
+EXP_KB = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="Без досвіду (стажер)")],
+        [KeyboardButton(text="0–6 міс"), KeyboardButton(text="6–24 міс")],
+        [KeyboardButton(text="2–5 років"), KeyboardButton(text="5+ років")],
+    ],
+    resize_keyboard=True,
+    one_time_keyboard=True,
+)
+
+SCHEDULE_KB = kb_from_options(["Повний день", "Зміни", "3–4 дні", "Інше (вписати)"], cols=2)
+READY_KB = kb_from_options(["Одразу", "1 тиж", "2 тиж", "Інше (вписати)"], cols=2)
+
 
 # -------------------------
-# ПИТАННЯ ПО РОЛЯХ
+# ПИТАННЯ З КНОПКАМИ
+# Кожен пункт: {"q": "...", "options": [...], "other": True/False}
+# Якщо other=True -> додається кнопка "Інше (вписати)"
 # -------------------------
-ROLE_QUESTIONS = {
+
+def with_other(opts: List[str]) -> List[str]:
+    return opts + ["Інше (вписати)"]
+
+
+QUESTIONS_PRO: Dict[str, List[Dict[str, Any]]] = {
     "✂️ Перукар": [
-        "Що у вас виходить найкраще? (2–4 пункти)",
-        "Ваш середній таймінг: чоловіча коротка / жіноча стрижка?",
-        "Що ви обов’язково уточнюєте в клієнта перед початком?",
-        "Що робите, якщо клієнт запізнився на 10–15 хв?",
-        "Чи готові працювати за стандартами (таймінги/сервіс/чистота)?",
+        {"q": "Що ви робите найкраще? (оберіть 1 основне)", "options": with_other(["Стрижки", "Укладки", "Фарбування", "Чоловічі стрижки", "Жіночі стрижки"])},
+        {"q": "Ваш рівень зараз:", "options": with_other(["Початковий", "Впевнений", "Профі/топ"])},
+        {"q": "Що уточнюєте перед стрижкою/послугою?", "options": with_other(["Довжина/форма", "Побажання клієнта", "Стан волосся", "Домашній догляд", "Все разом"])},
+        {"q": "Як дієте, якщо клієнт запізнився 10–15 хв?", "options": with_other(["Скорочую послугу", "Переношу запис", "Домовляюсь і працюю швидше", "За правилами салону"])},
+        {"q": "Готові працювати за стандартами сервісу і чистоти?", "options": ["Так", "Ні", "Потрібно обговорити"]},
     ],
     "💅 Манікюр/педикюр": [
-        "Який тип манікюру робите найчастіше (апарат/комбі/класика) і чому?",
-        "Опишіть коротко ваш протокол стерильності (кроки).",
-        "Ваш середній таймінг: манікюр+покриття / педикюр?",
-        "Як працюєте з тонкою пластиною або відшаруваннями?",
-        "Чи готові до стандартів салону (таймінги/сервіс/чистота)?",
+        {"q": "Який напрям вам ближчий?", "options": with_other(["Манікюр", "Педикюр", "І те, і те"])},
+        {"q": "Яка техніка у вас основна?", "options": with_other(["Апаратний", "Комбінований", "Класичний"])},
+        {"q": "Стерильність/гігієна:", "options": with_other(["Знаю і дотримуюсь", "Знаю частково", "Потрібно навчити з нуля"])},
+        {"q": "Ваш рівень зараз:", "options": with_other(["Початковий", "Впевнений", "Профі/топ"])},
+        {"q": "Готові працювати за стандартами сервісу і чистоти?", "options": ["Так", "Ні", "Потрібно обговорити"]},
     ],
     "👁️ Брови/вії": [
-        "Які процедури робите (брови/вії)?",
-        "Чи робите ламінування (брів/вій)? Якщо так — що саме?",
-        "Як підбираєте форму та досягаєте симетрії?",
-        "Як працюєте з алергіями/протипоказаннями?",
-        "Ваш середній таймінг на основні процедури?",
+        {"q": "Що робите?", "options": with_other(["Брови", "Вії", "Брови і вії"])},
+        {"q": "Ламінування:", "options": with_other(["Так, роблю", "Ні, але хочу навчитися", "Ні, не планую"])},
+        {"q": "Фарбування:", "options": with_other(["Так", "Ні", "Хочу навчитися"])},
+        {"q": "Ваш рівень зараз:", "options": with_other(["Початковий", "Впевнений", "Профі/топ"])},
+        {"q": "Готові працювати за стандартами сервісу і чистоти?", "options": ["Так", "Ні", "Потрібно обговорити"]},
     ],
     "🧾 Адміністратор": [
-        "Чи є досвід адміністрування/запису? Якщо так — який?",
-        "Чи працювали з дзвінками та повідомленнями (Instagram/Telegram)?",
-        "Що робите, якщо клієнт запізнився?",
-        "Як заповнюєте вікна в записі?",
-        "Чи готові працювати за стандартами сервісу та комунікації?",
+        {"q": "Досвід роботи з клієнтами:", "options": with_other(["Є (салон/сфера послуг)", "Є (інша сфера)", "Немає, але хочу навчитися"])},
+        {"q": "Робота з записом:", "options": with_other(["Вмію вести записи", "Вмію частково", "Потрібно навчити"])},
+        {"q": "Комунікація:", "options": with_other(["Впевнено спілкуюсь", "Нормально", "Хвилююсь, але вчитимусь"])},
+        {"q": "Стрес/конфлікти:", "options": with_other(["Спокійно вирішую", "Потрібні скрипти", "Поки важко"])},
+        {"q": "Готові до дисципліни і стандартів сервісу?", "options": ["Так", "Ні", "Потрібно обговорити"]},
     ],
 }
 
-
-# -------------------------
-# БОТ / DP / ROUTER
-# -------------------------
-router = Router()
-bot = Bot(BOT_TOKEN)  # без parse_mode
-dp = Dispatcher(storage=MemoryStorage())
-dp.include_router(router)
-
-
-async def safe_answer(message: Message, text: str, **kwargs):
-    try:
-        await message.answer(text, **kwargs)
-    except Exception as e:
-        log.exception("Помилка відправки повідомлення: %s", e)
+QUESTIONS_TRAINEE: Dict[str, List[Dict[str, Any]]] = {
+    "✂️ Перукар": [
+        {"q": "Ви хочете вчитись з нуля чи вже були курси?", "options": with_other(["З нуля", "Були курси", "Є мінімальна практика"])},
+        {"q": "Готові пройти навчання/курси?", "options": ["Так", "Ні", "Потрібно обговорити"]},
+        {"q": "Скільки часу готові виділяти на навчання щотижня?", "options": with_other(["2–4 години", "5–8 годин", "9+ годин"])},
+        {"q": "Що для вас важливо в роботі?", "options": with_other(["Якість", "Швидкість", "Сервіс", "Дисципліна", "Все разом"])},
+        {"q": "Коли готові стартувати стажування?", "options": with_other(["Одразу", "1 тиж", "2 тиж"])},
+    ],
+    "💅 Манікюр/педикюр": [
+        {"q": "Ви хочете вчитись з нуля чи вже були курси?", "options": with_other(["З нуля", "Були курси", "Є мінімальна практика"])},
+        {"q": "Готові пройти навчання/курси?", "options": ["Так", "Ні", "Потрібно обговорити"]},
+        {"q": "Що цікавіше?", "options": with_other(["Манікюр", "Педикюр", "І те, і те"])},
+        {"q": "Готові вчити гігієну/стерильність за стандартом?", "options": ["Так", "Ні", "Потрібно обговорити"]},
+        {"q": "Коли готові стартувати стажування?", "options": with_other(["Одразу", "1 тиж", "2 тиж"])},
+    ],
+    "👁️ Брови/вії": [
+        {"q": "Ви хочете вчитись з нуля чи вже були курси?", "options": with_other(["З нуля", "Були курси", "Є мінімальна практика"])},
+        {"q": "Що цікавіше?", "options": with_other(["Брови", "Вії", "Брови і вії"])},
+        {"q": "Готові пройти навчання/курси?", "options": ["Так", "Ні", "Потрібно обговорити"]},
+        {"q": "Готові працювати акуратно і за правилами безпеки?", "options": ["Так", "Ні", "Потрібно обговорити"]},
+        {"q": "Коли готові стартувати стажування?", "options": with_other(["Одразу", "1 тиж", "2 тиж"])},
+    ],
+    "🧾 Адміністратор": [
+        {"q": "Досвід роботи з людьми:", "options": with_other(["Є (сфера послуг)", "Є (інша сфера)", "Немає, але хочу навчитися"])},
+        {"q": "Готові вчитись: запис, повідомлення, дисципліна?", "options": ["Так", "Ні", "Потрібно обговорити"]},
+        {"q": "Чи впевнено користуєтесь телефоном/компʼютером?", "options": ["Так", "Ні", "Потрібно пояснити"]},
+        {"q": "Комунікація:", "options": with_other(["Впевнено", "Нормально", "Хвилююсь, але вчитимусь"])},
+        {"q": "Коли готові стартувати стажування?", "options": with_other(["Одразу", "1 тиж", "2 тиж"])},
+    ],
+}
 
 
 # -------------------------
@@ -164,17 +227,11 @@ async def cmd_myid(message: Message):
 async def cmd_setadmin(message: Message):
     admin_chat_id = message.chat.id
     save_admin_chat_id(admin_chat_id)
-
-    await safe_answer(
-        message,
-        "Адміністратор встановлений.\n"
-        f"ADMIN_CHAT_ID = {admin_chat_id}\n"
-        "Рекомендовано: додайте цей ADMIN_CHAT_ID у Render -> Environment, щоб не збивалося після деплою."
-    )
+    await safe_answer(message, f"Адміністратор встановлений. ADMIN_CHAT_ID = {admin_chat_id}")
     try:
         await bot.send_message(admin_chat_id, "Тест: адмін-чат підключено ✅")
     except Exception as e:
-        await safe_answer(message, f"Не зміг надіслати тестове повідомлення адміну: {e}")
+        await safe_answer(message, f"Не зміг надіслати тест адміну: {e}")
 
 
 @router.message(Command("cancel"))
@@ -195,64 +252,50 @@ async def cmd_start(message: Message, state: FSMContext):
 
 @router.message(Form.age, F.text)
 async def handle_age(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
     try:
-        text = (message.text or "").strip()
-        try:
-            age = int(text)
-        except ValueError:
-            await safe_answer(message, "Будь ласка, напишіть вік цифрами (наприклад: 22).")
-            return
+        age = int(text)
+    except ValueError:
+        await safe_answer(message, "Будь ласка, напишіть вік цифрами (наприклад: 22).")
+        return
 
-        if age < 18:
-            await safe_answer(message, "Дякую! Ми розглядаємо кандидатів лише 18+.")
-            await state.clear()
-            return
-
-        await state.update_data(age=age)
-
-        await safe_answer(
-            message,
-            "Працюємо конфіденційно. Деталі (бренд/локація) — після відбору.\n"
-            "Щоб продовжити, натисніть або напишіть: Погоджуюсь ✅",
-            reply_markup=YES_KB,
-        )
-        await state.set_state(Form.consent)
-
-    except Exception as e:
-        log.exception("Помилка на етапі віку: %s", e)
-        await safe_answer(message, "Сталася технічна помилка. Спробуйте ще раз: /start")
+    if age < 18:
+        await safe_answer(message, "Дякую! Ми розглядаємо кандидатів лише 18+.")
         await state.clear()
+        return
 
+    await state.update_data(age=age)
 
-@router.message(Form.age)
-async def handle_age_not_text(message: Message):
-    await safe_answer(message, "Напишіть, будь ласка, вік цифрами (наприклад: 22).")
+    await safe_answer(
+        message,
+        "Працюємо конфіденційно. Деталі (бренд/локація) — після відбору.\n"
+        "Щоб продовжити, натисніть або напишіть: Погоджуюсь ✅",
+        reply_markup=YES_KB,
+    )
+    await state.set_state(Form.consent)
 
 
 @router.message(Form.consent, F.text)
 async def handle_consent(message: Message, state: FSMContext):
-    try:
-        txt = (message.text or "").strip().lower()
-        if "погодж" not in txt:
-            await safe_answer(message, "Щоб продовжити, напишіть: Погоджуюсь ✅", reply_markup=YES_KB)
-            return
+    txt = (message.text or "").strip().lower()
+    if "погодж" not in txt:
+        await safe_answer(message, "Щоб продовжити, натисніть або напишіть: Погоджуюсь ✅", reply_markup=YES_KB)
+        return
 
-        await safe_answer(message, "Оберіть позицію:", reply_markup=ROLE_KB)
-        await state.set_state(Form.role)
-
-    except Exception as e:
-        log.exception("Помилка на етапі згоди: %s", e)
-        await safe_answer(message, "Сталася технічна помилка. Спробуйте ще раз: /start")
-        await state.clear()
+    await safe_answer(message, "Оберіть позицію:", reply_markup=ROLE_KB)
+    await state.set_state(Form.role)
 
 
-# -------------------------
-# АНКЕТА
-# -------------------------
 @router.message(Form.role, F.text)
 async def handle_role(message: Message, state: FSMContext):
     role = (message.text or "").strip()
-    if role not in ROLE_QUESTIONS:
+    if role not in ROLE_KB.model_dump()["keyboard"][0][0].keys() and role not in ["✂️ Перукар", "💅 Манікюр/педикюр", "👁️ Брови/вії", "🧾 Адміністратор"]:
+        # страховка
+        if role not in ["✂️ Перукар", "💅 Манікюр/педикюр", "👁️ Брови/вії", "🧾 Адміністратор"]:
+            await safe_answer(message, "Оберіть позицію кнопкою нижче:", reply_markup=ROLE_KB)
+            return
+
+    if role not in ["✂️ Перукар", "💅 Манікюр/педикюр", "👁️ Брови/вії", "🧾 Адміністратор"]:
         await safe_answer(message, "Оберіть позицію кнопкою нижче:", reply_markup=ROLE_KB)
         return
 
@@ -267,7 +310,6 @@ async def handle_name(message: Message, state: FSMContext):
     if len(name) < 2:
         await safe_answer(message, "Напишіть ім’я (або псевдонім) ще раз.")
         return
-
     await state.update_data(name=name)
     await safe_answer(message, "Контакт (номер телефону або Telegram-нік):")
     await state.set_state(Form.contact)
@@ -281,60 +323,113 @@ async def handle_contact(message: Message, state: FSMContext):
         return
 
     await state.update_data(contact=contact)
+
     await safe_answer(
         message,
-        "Досвід роботи (напишіть одним рядком):\n"
-        "0–6 міс / 6–24 міс / 2–5 років / 5+ років"
+        "Досвід роботи: оберіть варіант кнопкою нижче (або напишіть текстом).",
+        reply_markup=EXP_KB
     )
     await state.set_state(Form.experience)
 
 
 @router.message(Form.experience, F.text)
 async def handle_experience(message: Message, state: FSMContext):
-    exp = (message.text or "").strip()
-    if len(exp) < 2:
-        await safe_answer(message, "Напишіть досвід ще раз (коротко).")
+    exp_raw = (message.text or "").strip()
+
+    # приймаємо навіть "0"
+    exp_map = {
+        "0": "0–6 міс",
+        "0-6": "0–6 міс",
+        "0–6": "0–6 міс",
+        "0 6": "0–6 міс",
+        "6-24": "6–24 міс",
+        "6–24": "6–24 міс",
+    }
+    exp = exp_map.get(exp_raw.lower(), exp_raw)
+
+    if len(exp) < 1:
+        await safe_answer(message, "Оберіть досвід кнопкою або напишіть текстом.")
         return
 
-    data = await state.get_data()
-    role = data.get("role")
-    questions = ROLE_QUESTIONS.get(role, [])
+    role = (await state.get_data()).get("role")
+    exp_low = exp.lower()
+    is_trainee = ("без досвіду" in exp_low) or ("стаж" in exp_low)
 
-    await state.update_data(experience=exp, questions=questions, q_index=0, answers=[])
+    qlist = (QUESTIONS_TRAINEE if is_trainee else QUESTIONS_PRO).get(role, [])
 
-    if questions:
-        await safe_answer(message, f"Питання 1/{len(questions)}:\n{questions[0]}")
-        await state.set_state(Form.qa)
-    else:
-        await safe_answer(message, "Надішліть 1–10 фото робіт або посилання. Якщо немає — напишіть: немає. Коли завершите — напишіть: далі")
+    await state.update_data(
+        experience=exp,
+        is_trainee=is_trainee,
+        qlist=qlist,
+        q_index=0,
+        answers=[],
+        waiting_other=False
+    )
+
+    await safe_answer(message, "Дякую! Переходимо до коротких питань.", reply_markup=ReplyKeyboardRemove())
+
+    if not qlist:
+        await safe_answer(message, "Фото робіт (якщо є) або посилання. Якщо немає — напишіть: немає. Коли завершите — напишіть: далі")
         await state.set_state(Form.portfolio)
+        return
+
+    # Питання 1
+    q0 = qlist[0]
+    await safe_answer(message, f"Питання 1/{len(qlist)}:\n{q0['q']}", reply_markup=kb_from_options(q0["options"]))
+    await state.set_state(Form.qa)
 
 
 @router.message(Form.qa, F.text)
 async def handle_qa(message: Message, state: FSMContext):
-    answer = (message.text or "").strip()
-    if not answer:
-        await safe_answer(message, "Дайте коротку відповідь текстом.")
-        return
-
     data = await state.get_data()
-    questions: List[str] = data.get("questions", [])
+    qlist: List[Dict[str, Any]] = data.get("qlist", [])
     q_index: int = data.get("q_index", 0)
     answers: List[str] = data.get("answers", [])
+    waiting_other: bool = data.get("waiting_other", False)
 
-    answers.append(answer)
-    q_index += 1
-    await state.update_data(q_index=q_index, answers=answers)
+    text = (message.text or "").strip()
 
-    if q_index < len(questions):
-        await safe_answer(message, f"Питання {q_index+1}/{len(questions)}:\n{questions[q_index]}")
+    if not qlist or q_index >= len(qlist):
+        # страховка
+        await safe_answer(message, "Йдемо далі.")
+        await state.set_state(Form.portfolio)
         return
 
+    # якщо до цього натиснули "Інше (вписати)" — тепер чекаємо довільний текст
+    if waiting_other:
+        if len(text) < 2:
+            await safe_answer(message, "Напишіть, будь ласка, відповідь текстом одним повідомленням.")
+            return
+        answers.append(text)
+        await state.update_data(answers=answers, waiting_other=False)
+    else:
+        # якщо натиснули "Інше (вписати)"
+        if text == "Інше (вписати)":
+            await state.update_data(waiting_other=True)
+            await safe_answer(message, "Напишіть вашу відповідь текстом одним повідомленням:", reply_markup=ReplyKeyboardRemove())
+            return
+
+        # звичайна відповідь кнопкою
+        answers.append(text)
+        await state.update_data(answers=answers)
+
+    # наступне питання
+    q_index += 1
+    await state.update_data(q_index=q_index)
+
+    if q_index < len(qlist):
+        qn = qlist[q_index]
+        await safe_answer(message, f"Питання {q_index+1}/{len(qlist)}:\n{qn['q']}", reply_markup=kb_from_options(qn["options"]))
+        return
+
+    # кінець питань -> портфоліо
     await safe_answer(
         message,
+        "Дякую! Тепер портфоліо.\n"
         "Надішліть 1–10 фото робіт (можна кількома повідомленнями) або посилання.\n"
-        "Якщо портфоліо немає — напишіть: немає\n"
-        "Коли завершите — напишіть: далі"
+        "Якщо немає — напишіть: немає\n"
+        "Коли завершите — напишіть: далі",
+        reply_markup=ReplyKeyboardRemove()
     )
     await state.update_data(portfolio_photos=[], portfolio_links=[])
     await state.set_state(Form.portfolio)
@@ -346,10 +441,9 @@ async def handle_portfolio_photo(message: Message, state: FSMContext):
     photos: List[str] = data.get("portfolio_photos", [])
 
     if len(photos) < 10:
-        file_id = message.photo[-1].file_id
-        photos.append(file_id)
+        photos.append(message.photo[-1].file_id)
+        await state.update_data(portfolio_photos=photos)
 
-    await state.update_data(portfolio_photos=photos)
     await safe_answer(message, f"Фото додано ({len(photos)}/10). Надішліть ще або напишіть: далі")
 
 
@@ -357,17 +451,18 @@ async def handle_portfolio_photo(message: Message, state: FSMContext):
 async def handle_portfolio_text(message: Message, state: FSMContext):
     txt = (message.text or "").strip()
 
-    if txt.lower() == "далі":
-        await safe_answer(message, "Який графік вам підходить? (повний день / зміни / 3–4 дні / інше)")
-        await state.set_state(Form.schedule)
-        return
-
     if txt.lower() == "немає":
         await state.update_data(portfolio_photos=[], portfolio_links=[])
-        await safe_answer(message, "Ок. Який графік вам підходить? (повний день / зміни / 3–4 дні / інше)")
+        await safe_answer(message, "Ок. Який графік вам підходить?", reply_markup=SCHEDULE_KB)
         await state.set_state(Form.schedule)
         return
 
+    if txt.lower() == "далі":
+        await safe_answer(message, "Який графік вам підходить?", reply_markup=SCHEDULE_KB)
+        await state.set_state(Form.schedule)
+        return
+
+    # інакше це посилання/текст
     data = await state.get_data()
     links: List[str] = data.get("portfolio_links", [])
     links.append(txt)
@@ -377,35 +472,54 @@ async def handle_portfolio_text(message: Message, state: FSMContext):
 
 @router.message(Form.schedule, F.text)
 async def handle_schedule(message: Message, state: FSMContext):
-    schedule = (message.text or "").strip()
-    if len(schedule) < 2:
-        await safe_answer(message, "Напишіть ваш варіант графіку.")
+    txt = (message.text or "").strip()
+    if txt == "Інше (вписати)":
+        await safe_answer(message, "Напишіть ваш графік одним повідомленням:", reply_markup=ReplyKeyboardRemove())
+        await state.update_data(waiting_schedule_other=True)
         return
 
-    await state.update_data(schedule=schedule)
-    await safe_answer(message, "Коли готові вийти/почати? (одразу / 1 тиж / 2 тиж / дата)")
+    data = await state.get_data()
+    if data.get("waiting_schedule_other"):
+        if len(txt) < 2:
+            await safe_answer(message, "Напишіть графік ще раз (коротко).")
+            return
+        await state.update_data(waiting_schedule_other=False, schedule=txt)
+    else:
+        await state.update_data(schedule=txt)
+
+    await safe_answer(message, "Коли готові вийти/почати?", reply_markup=READY_KB)
     await state.set_state(Form.start_ready)
 
 
 @router.message(Form.start_ready, F.text)
 async def handle_start_ready(message: Message, state: FSMContext):
-    start_ready = (message.text or "").strip()
-    if len(start_ready) < 2:
-        await safe_answer(message, "Напишіть, будь ласка, коли готові почати.")
+    txt = (message.text or "").strip()
+
+    if txt == "Інше (вписати)":
+        await safe_answer(message, "Напишіть, коли готові почати (дата/період):", reply_markup=ReplyKeyboardRemove())
+        await state.update_data(waiting_ready_other=True)
         return
 
-    await state.update_data(start_ready=start_ready)
+    data = await state.get_data()
+    if data.get("waiting_ready_other"):
+        if len(txt) < 2:
+            await safe_answer(message, "Напишіть ще раз (коротко).")
+            return
+        await state.update_data(waiting_ready_other=False, start_ready=txt)
+    else:
+        await state.update_data(start_ready=txt)
 
     data = await state.get_data()
     admin_chat_id = load_admin_chat_id()
 
-    age = data.get("age", "—")
     role = data.get("role", "—")
     name = data.get("name", "—")
+    age = data.get("age", "—")
     contact = data.get("contact", "—")
     experience = data.get("experience", "—")
     schedule = data.get("schedule", "—")
-    questions = data.get("questions", [])
+    start_ready = data.get("start_ready", "—")
+    qlist = data.get("qlist", [])
     answers = data.get("answers", [])
     links = data.get("portfolio_links", [])
     photos = data.get("portfolio_photos", [])
@@ -414,9 +528,10 @@ async def handle_start_ready(message: Message, state: FSMContext):
     user_id = message.from_user.id
 
     qa_lines = []
-    for i, q in enumerate(questions):
-        a = answers[i] if i < len(answers) else "—"
-        qa_lines.append(f"{i+1}) {q}\nВідповідь: {a}")
+    for i, q in enumerate(qlist):
+        qtext = q.get("q", "—")
+        atext = answers[i] if i < len(answers) else "—"
+        qa_lines.append(f"{i+1}) {qtext}\nВідповідь: {atext}")
 
     links_text = "\n".join(links) if links else "—"
 
@@ -459,23 +574,17 @@ async def handle_start_ready(message: Message, state: FSMContext):
 
     except Exception as e:
         log.exception("Помилка відправки адміну: %s", e)
-        await safe_answer(message, f"Не вдалося надіслати адміну. Спробуйте /setadmin ще раз. Помилка: {e}")
+        await safe_answer(message, f"Не вдалося надіслати адміну. Спробуйте /setadmin. Помилка: {e}")
     finally:
         await state.clear()
 
 
-# -------------------------
-# ГЛОБАЛЬНИЙ ЛОВЕЦЬ ПОМИЛОК
-# -------------------------
 @router.errors()
 async def on_error(event, exception):
     log.exception("Unhandled error: %s", exception)
     return True
 
 
-# -------------------------
-# ЗАПУСК
-# -------------------------
 async def main():
     log.info("Bot started polling...")
     await dp.start_polling(bot)
