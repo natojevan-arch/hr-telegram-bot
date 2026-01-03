@@ -1,315 +1,474 @@
-import asyncio
 import os
-from datetime import datetime
+import json
+from typing import List, Optional
 
-from aiogram import Bot, Dispatcher, F
-from aiogram.filters import Command
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     Message,
     ReplyKeyboardMarkup,
     KeyboardButton,
     ReplyKeyboardRemove,
+    InputMediaPhoto,
 )
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import StatesGroup, State
 
-# ========= Налаштування =========
+
+# =========================
+# НАЛАШТУВАННЯ
+# =========================
+
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-
-_admin_env = os.getenv("ADMIN_CHAT_ID", "").strip()
-ADMIN_CHAT_ID = int(_admin_env) if _admin_env.isdigit() else 0
-
 if not BOT_TOKEN:
-    raise RuntimeError('BOT_TOKEN не заданий. Задайте: set "BOT_TOKEN=..."')
+    raise RuntimeError("Не задано BOT_TOKEN у змінних середовища.")
 
-CONF_TEXT = (
-    "⚠️ Конфіденційно: бренд/локація повідомляються лише після відбору.\n"
-    "Просимо не публікувати переписку/умови та не ставити геолокацію."
-)
+# Якщо ADMIN_CHAT_ID не задано або 0 — можна встановити через /setadmin
+ADMIN_CHAT_ID_ENV = os.getenv("ADMIN_CHAT_ID", "0").strip()
 
-ROLES = [
-    "✂️ Перукар",
-    "💅 Манікюр/Педикюр",
-    "👁️ Брови/Вії",
-    "🧾 Адміністратор",
-]
+CONFIG_FILE = "config.json"  # локальний файл для збереження admin_chat_id (допоміжно)
 
-role_kb = ReplyKeyboardMarkup(
-    keyboard=[[KeyboardButton(text=r)] for r in ROLES],
-    resize_keyboard=True,
-    one_time_keyboard=True,
-)
 
-def make_app_id(role_short: str) -> str:
-    return f"{role_short}-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+def load_admin_chat_id() -> int:
+    """Повертає admin_chat_id: спочатку ENV, інакше з config.json, інакше 0."""
+    # 1) ENV
+    try:
+        env_id = int(ADMIN_CHAT_ID_ENV)
+    except ValueError:
+        env_id = 0
+    if env_id:
+        return env_id
 
-# ========= FSM анкета =========
+    # 2) config.json
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            val = int(data.get("admin_chat_id", 0))
+            return val
+        except Exception:
+            return 0
+
+    return 0
+
+
+def save_admin_chat_id(admin_chat_id: int) -> None:
+    """Зберігає admin_chat_id у config.json (на випадок якщо ENV=0)."""
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump({"admin_chat_id": admin_chat_id}, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+# =========================
+# FSM СТАНИ
+# =========================
+
 class Form(StatesGroup):
-    agree = State()
+    age = State()
+    consent = State()
     role = State()
     name = State()
     contact = State()
     experience = State()
-    skills = State()
-    portfolio = State()
+    qa = State()         # універсальний стан для 5 питань по ролі
+    portfolio = State()  # фото робіт / посилання
     schedule = State()
-    ready = State()
+    start_ready = State()
 
-# ========= Бот =========
+
+# =========================
+# КЛАВІАТУРИ
+# =========================
+
+ROLE_KB = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="✂️ Перукар")],
+        [KeyboardButton(text="💅 Манікюр/педикюр")],
+        [KeyboardButton(text="👁️ Брови/вії")],
+        [KeyboardButton(text="🧾 Адміністратор")],
+    ],
+    resize_keyboard=True,
+    one_time_keyboard=True,
+)
+
+YES_KB = ReplyKeyboardMarkup(
+    keyboard=[[KeyboardButton(text="Погоджуюсь")]],
+    resize_keyboard=True,
+    one_time_keyboard=True,
+)
+
+
+# =========================
+# ПИТАННЯ ПО РОЛЯХ
+# =========================
+
+ROLE_QUESTIONS = {
+    "✂️ Перукар": [
+        "Що у вас виходить найкраще? (2–4 пункти)",
+        "Ваш середній таймінг: чоловіча коротка / жіноча стрижка?",
+        "Що ви обов’язково уточнюєте в клієнта перед початком?",
+        "Що робите, якщо клієнт запізнився на 10–15 хв?",
+        "Чи готові працювати за стандартами (таймінги/сервіс/чистота)?",
+    ],
+    "💅 Манікюр/педикюр": [
+        "Який тип манікюру робите найчастіше (апарат/комбі/класика) і чому?",
+        "Опишіть коротко ваш протокол стерильності (кроки).",
+        "Ваш середній таймінг: манікюр+покриття / педикюр?",
+        "Як працюєте з тонкою пластиною або відшаруваннями?",
+        "Чи готові до стандартів салону (таймінги/сервіс/чистота)?",
+    ],
+    "👁️ Брови/вії": [
+        "Які процедури робите (брови/вії)?",
+        "Чи робите ламінування (брів/вій)? Якщо так — що саме?",
+        "Як підбираєте форму та досягаєте симетрії?",
+        "Як працюєте з алергіями/протипоказаннями?",
+        "Ваш середній таймінг на основні процедури?",
+    ],
+    "🧾 Адміністратор": [
+        "Чи є досвід адміністрування/запису? Якщо так — який?",
+        "Чи працювали з дзвінками та повідомленнями (Instagram/Telegram)?",
+        "Що робите, якщо клієнт запізнився?",
+        "Як заповнюєте ‘вікна’ в записі?",
+        "Чи готові працювати за стандартами сервісу та комунікації?",
+    ],
+}
+
+
+# =========================
+# БОТ / ROUTER
+# =========================
+
+router = Router()
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
+dp.include_router(router)
 
-# --- Службові команди ---
-@dp.message(Command("start"))
-async def start(message: Message, state: FSMContext):
-    await state.clear()
-    # підготуємо місце під фото
-    await state.update_data(portfolio_photos=[])
+
+# =========================
+# КОМАНДИ
+# =========================
+
+@router.message(Command("myid"))
+async def cmd_myid(message: Message):
     await message.answer(
-        "Вітаю! Це конфіденційний бот для набору персоналу.\n\n"
-        f"{CONF_TEXT}\n\n"
-        "Щоб почати анкету, підтвердіть згоду:\n"
-        "Напишіть: **Погоджуюсь**",
-        parse_mode="Markdown",
-        reply_markup=ReplyKeyboardRemove()
+        f"Ваш chat_id: {message.chat.id}\nВаш user_id: {message.from_user.id}"
     )
-    await state.set_state(Form.agree)
 
-@dp.message(Command("myid"))
-async def myid(message: Message):
-    await message.answer(f"Ваш chat_id: {message.chat.id}\nВаш user_id: {message.from_user.id}")
 
-@dp.message(Command("setadmin"))
-async def setadmin(message: Message):
-    global ADMIN_CHAT_ID
-    ADMIN_CHAT_ID = message.chat.id
-    await message.answer("✅ Адміністратор встановлений. Тепер заявки приходитимуть сюди.")
+@router.message(Command("setadmin"))
+async def cmd_setadmin(message: Message):
+    admin_chat_id = message.chat.id
+    save_admin_chat_id(admin_chat_id)
+    await message.answer(
+        f"✅ Адміністратор встановлений.\nADMIN_CHAT_ID = {admin_chat_id}"
+    )
+    # тест
+    try:
+        await bot.send_message(admin_chat_id, "Тест: адмін-чат підключено ✅")
+    except Exception as e:
+        await message.answer(f"⚠️ Не зміг надіслати тестове повідомлення: {e}")
 
-@dp.message(Command("cancel"))
-async def cancel(message: Message, state: FSMContext):
+
+@router.message(Command("cancel"))
+async def cmd_cancel(message: Message, state: FSMContext):
     await state.clear()
-    await message.answer("Скасовано. Щоб почати знову — /start")
+    await message.answer("Скасовано. Щоб почати знову — /start", reply_markup=ReplyKeyboardRemove())
 
-# --- Анкета ---
-@dp.message(Form.agree)
-async def agree_step(message: Message, state: FSMContext):
-    text = message.text.strip().lower()
-    if "погод" not in text:
-        await message.answer("Щоб продовжити, напишіть слово: **Погоджуюсь**", parse_mode="Markdown")
+
+# =========================
+# START -> ВІК
+# =========================
+
+@router.message(CommandStart())
+async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer(
+        "Вітаю! 👋\nСкільки вам років? (вкажіть цифрами)",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    await state.set_state(Form.age)
+
+
+@router.message(Form.age)
+async def handle_age(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+
+    try:
+        age = int(text)
+    except ValueError:
+        await message.answer("Будь ласка, напишіть вік **цифрами** (наприклад: 22).")
         return
 
-    await message.answer("Дякую ✅ Оберіть позицію:", reply_markup=role_kb)
+    if age < 18:
+        await message.answer("Дякую! На жаль, ми розглядаємо кандидатів лише **18+**. 🙏")
+        await state.clear()
+        return
+
+    await state.update_data(age=age)
+
+    await message.answer(
+        "Працюємо **конфіденційно**. Деталі (бренд/локація) — після відбору.\n"
+        "Щоб продовжити, натисніть або напишіть: **Погоджуюсь** ✅",
+        reply_markup=YES_KB,
+    )
+    await state.set_state(Form.consent)
+
+
+@router.message(Form.consent)
+async def handle_consent(message: Message, state: FSMContext):
+    txt = (message.text or "").strip().lower()
+    if "погодж" not in txt:
+        await message.answer("Щоб продовжити, напишіть: **Погоджуюсь** ✅", reply_markup=YES_KB)
+        return
+
+    await message.answer("Оберіть позицію:", reply_markup=ROLE_KB)
     await state.set_state(Form.role)
 
-@dp.message(Form.role)
-async def role_step(message: Message, state: FSMContext):
-    if message.text not in ROLES:
-        await message.answer("Оберіть позицію з меню 👇", reply_markup=role_kb)
+
+# =========================
+# АНКЕТА
+# =========================
+
+@router.message(Form.role)
+async def handle_role(message: Message, state: FSMContext):
+    role = (message.text or "").strip()
+    if role not in ROLE_QUESTIONS:
+        await message.answer("Будь ласка, оберіть позицію кнопкою нижче 👇", reply_markup=ROLE_KB)
         return
 
-    await state.update_data(role=message.text)
-
-    await message.answer("Як до вас звертатися? (ім’я або псевдонім)", reply_markup=ReplyKeyboardRemove())
+    await state.update_data(role=role)
+    await message.answer("Ваше ім’я або псевдонім:", reply_markup=ReplyKeyboardRemove())
     await state.set_state(Form.name)
 
-@dp.message(Form.name)
-async def name_step(message: Message, state: FSMContext):
-    await state.update_data(name=message.text.strip())
-    await message.answer("Контакт: номер телефону або Telegram-нік (@...)")
+
+@router.message(Form.name)
+async def handle_name(message: Message, state: FSMContext):
+    name = (message.text or "").strip()
+    if len(name) < 2:
+        await message.answer("Напишіть, будь ласка, ім’я (або псевдонім) ще раз.")
+        return
+    await state.update_data(name=name)
+    await message.answer("Контакт (номер телефону або Telegram-нік):")
     await state.set_state(Form.contact)
 
-@dp.message(Form.contact)
-async def contact_step(message: Message, state: FSMContext):
-    await state.update_data(contact=message.text.strip())
-    await message.answer("Досвід: 0–6 міс / 6–24 міс / 2–5 років / 5+ (коротко)")
+
+@router.message(Form.contact)
+async def handle_contact(message: Message, state: FSMContext):
+    contact = (message.text or "").strip()
+    if len(contact) < 3:
+        await message.answer("Напишіть контакт ще раз (телефон або Telegram-нік).")
+        return
+    await state.update_data(contact=contact)
+    await message.answer(
+        "Досвід роботи:\n"
+        "• 0–6 міс\n• 6–24 міс\n• 2–5 років\n• 5+ років\n\n"
+        "Напишіть одним рядком."
+    )
     await state.set_state(Form.experience)
 
-@dp.message(Form.experience)
-async def experience_step(message: Message, state: FSMContext):
-    await state.update_data(experience=message.text.strip())
+
+@router.message(Form.experience)
+async def handle_experience(message: Message, state: FSMContext):
+    exp = (message.text or "").strip()
+    if len(exp) < 2:
+        await message.answer("Напишіть досвід ще раз (коротко).")
+        return
 
     data = await state.get_data()
-    role = data.get("role", "")
+    role = data.get("role")
+    questions = ROLE_QUESTIONS.get(role, [])
 
-    if role == "✂️ Перукар":
-        q = (
-            "5 питань (коротко):\n"
-            "1) Що робите найкраще (2–4 пункти)?\n"
-            "2) Таймінг: чоловіча коротка / жіноча стрижка?\n"
-            "3) Що питаєте перед початком?\n"
-            "4) Що робите при запізненні клієнта 10–15 хв?\n"
-            "5) Чи готові працювати за стандартами салону (таймінги/сервіс/чистота)?"
-        )
-    elif role == "💅 Манікюр/Педикюр":
-        q = (
-            "5 питань (коротко):\n"
-            "1) Який тип манікюру: апарат/комбі/класика — і чому?\n"
-            "2) Опишіть протокол стерильності (кроки).\n"
-            "3) Таймінг: манікюр+покриття / педикюр?\n"
-            "4) Як працюєте з тонкою пластиною/відшаруваннями?\n"
-            "5) Чи готові до стандартів салону (таймінги/запис/чистота)?"
-        )
-    elif role == "👁️ Брови/Вії":
-        q = (
-            "Коротко відповідайте:\n"
-            "1) Які процедури робите (брови/вії)?\n"
-            "2) Чи робите ламінування (брів/вій)?\n"
-            "3) Як підбираєте форму/симетрію?\n"
-            "4) Як працюєте з алергіями/протипоказаннями?\n"
-            "5) Ваш таймінг на основні процедури?"
-        )
-    else:  # Адміністратор
-        q = (
-            "Коротко відповідайте:\n"
-            "1) Чи є досвід адміністрування/запису?\n"
-            "2) Чи працювали з Instagram Direct/дзвінками?\n"
-            "3) Як дієте, якщо клієнт запізнився?\n"
-            "4) Як заповнюєте 'вікна' у записі?\n"
-            "5) Чи готові працювати за стандартами сервісу?"
-        )
+    await state.update_data(experience=exp, questions=questions, q_index=0, answers=[])
 
-    await message.answer(q)
-    await state.set_state(Form.skills)
+    # Питаємо перше питання
+    if questions:
+        await message.answer(f"Питання 1/{len(questions)}:\n{questions[0]}")
+        await state.set_state(Form.qa)
+    else:
+        # на всяк випадок
+        await message.answer("Надішліть, будь ласка, 1–10 фото робіт або посилання. Якщо немає — напишіть: немає.\nКоли завершите — напишіть: далі")
+        await state.set_state(Form.portfolio)
 
-@dp.message(Form.skills)
-async def skills_step(message: Message, state: FSMContext):
-    await state.update_data(skills=message.text.strip())
 
-    # Обнуляємо список фото на всяк випадок
-    await state.update_data(portfolio_photos=[])
+@router.message(Form.qa)
+async def handle_qa(message: Message, state: FSMContext):
+    answer = (message.text or "").strip()
+    if len(answer) < 1:
+        await message.answer("Будь ласка, дайте коротку відповідь текстом.")
+        return
 
+    data = await state.get_data()
+    questions: List[str] = data.get("questions", [])
+    q_index: int = data.get("q_index", 0)
+    answers: List[str] = data.get("answers", [])
+
+    answers.append(answer)
+    q_index += 1
+
+    await state.update_data(q_index=q_index, answers=answers)
+
+    if q_index < len(questions):
+        await message.answer(f"Питання {q_index+1}/{len(questions)}:\n{questions[q_index]}")
+        return
+
+    # Переходимо до портфоліо
     await message.answer(
-        "Портфоліо:\n"
-        "— надішліть 1–10 фото робіт прямо сюди (можна кілька повідомлень), або\n"
-        "— надішліть посилання (Instagram/Drive), або\n"
-        "— напишіть 'немає'.\n\n"
-        "Коли закінчите з фото — напишіть: **далі**",
-        parse_mode="Markdown"
+        "Надішліть **1–10 фото робіт** (можна кількома повідомленнями) або **посилання**.\n"
+        "Якщо портфоліо немає — напишіть: **немає**\n"
+        "Коли завершите — напишіть: **далі**"
     )
+    await state.update_data(portfolio_photos=[], portfolio_links=[])
     await state.set_state(Form.portfolio)
 
-# --- ПОРТФОЛІО: фото ---
-@dp.message(Form.portfolio, F.photo)
-async def portfolio_photo(message: Message, state: FSMContext):
-    data = await state.get_data()
-    photos = data.get("portfolio_photos", [])
 
-    # Беремо найбільший розмір фото
+@router.message(Form.portfolio, F.photo)
+async def handle_portfolio_photo(message: Message, state: FSMContext):
+    data = await state.get_data()
+    photos: List[str] = data.get("portfolio_photos", [])
+
+    # беремо найбільший розмір
     file_id = message.photo[-1].file_id
     photos.append(file_id)
 
     await state.update_data(portfolio_photos=photos)
+    await message.answer(f"✅ Фото додано ({len(photos)}/10). Надішліть ще або напишіть: далі")
 
-    await message.answer(
-        f"📷 Фото додано ({len(photos)}). Можете надіслати ще або напишіть **далі**.",
-        parse_mode="Markdown"
-    )
 
-# --- ПОРТФОЛІО: текст/посилання/далі ---
-@dp.message(Form.portfolio)
-async def portfolio_text(message: Message, state: FSMContext):
-    txt = message.text.strip()
+@router.message(Form.portfolio)
+async def handle_portfolio_text(message: Message, state: FSMContext):
+    txt = (message.text or "").strip()
 
-    # Якщо людина завершила портфоліо
-    if txt.lower() in ["далі", "далi", "готово", "next"]:
-        await state.update_data(portfolio_text="(фото надіслані в чат)" )
-        await message.answer("Який графік вам підходить: повний день / зміни / 3–4 дні?")
+    if txt.lower() == "далі":
+        # йдемо далі
+        await message.answer(
+            "Який графік вам підходить?\n"
+            "Наприклад: повний день / зміни / 3–4 дні / інше"
+        )
         await state.set_state(Form.schedule)
         return
 
-    # Якщо людина пише, що нема
-    if txt.lower() in ["немає", "нема", "no"]:
-        await state.update_data(portfolio_text="немає", portfolio_photos=[])
-        await message.answer("Який графік вам підходить: повний день / зміни / 3–4 дні?")
+    if txt.lower() == "немає":
+        await state.update_data(portfolio_photos=[], portfolio_links=[])
+        await message.answer(
+            "Ок. Який графік вам підходить?\n"
+            "Наприклад: повний день / зміни / 3–4 дні / інше"
+        )
         await state.set_state(Form.schedule)
         return
 
-    # Якщо це посилання або просто текст
-    await state.update_data(portfolio_text=txt)
-    await message.answer(
-        "Дякую! Якщо хочете — ще надішліть фото робіт.\n"
-        "Коли завершите — напишіть **далі**.",
-        parse_mode="Markdown"
-    )
-
-@dp.message(Form.schedule)
-async def schedule_step(message: Message, state: FSMContext):
-    await state.update_data(schedule=message.text.strip())
-    await message.answer("Коли готові вийти: одразу / 1 тиж / 2 тиж / інше?")
-    await state.set_state(Form.ready)
-
-@dp.message(Form.ready)
-async def ready_step(message: Message, state: FSMContext):
-    await state.update_data(ready=message.text.strip())
+    # Якщо це посилання або текст-портфоліо — зберігаємо
     data = await state.get_data()
+    links: List[str] = data.get("portfolio_links", [])
+    links.append(txt)
+    await state.update_data(portfolio_links=links)
+    await message.answer("✅ Додано. Можна ще або напишіть: далі")
 
-    role = data.get("role", "")
-    role_short = {
-        "✂️ Перукар": "HAIR",
-        "💅 Манікюр/Педикюр": "NAIL",
-        "👁️ Брови/Вії": "BROW",
-        "🧾 Адміністратор": "ADMIN",
-    }.get(role, "APP")
 
-    app_id = make_app_id(role_short)
+@router.message(Form.schedule)
+async def handle_schedule(message: Message, state: FSMContext):
+    schedule = (message.text or "").strip()
+    if len(schedule) < 2:
+        await message.answer("Напишіть, будь ласка, ваш варіант графіку.")
+        return
+    await state.update_data(schedule=schedule)
+    await message.answer("Коли ви готові вийти/почати? (наприклад: одразу / 1 тиждень / 2 тижні / дата)")
+    await state.set_state(Form.start_ready)
 
-    # Повідомлення кандидату
-    await message.answer(
-        f"✅ Дякую! Анкету прийнято.\n"
-        f"Код заявки: {app_id}\n"
-        "Ми напишемо вам у цьому чаті, якщо запросимо на пробний.",
-        reply_markup=ReplyKeyboardRemove(),
-    )
 
-    # Повідомлення адміну (текст)
-    portfolio_text = data.get("portfolio_text", "")
-    photos = data.get("portfolio_photos", []) or []
+@router.message(Form.start_ready)
+async def handle_start_ready(message: Message, state: FSMContext):
+    start_ready = (message.text or "").strip()
+    if len(start_ready) < 2:
+        await message.answer("Напишіть, будь ласка, коли готові почати.")
+        return
 
-    admin_text = (
-        f"🆕 Нова заявка: {app_id}\n"
+    await state.update_data(start_ready=start_ready)
+
+    data = await state.get_data()
+    admin_chat_id = load_admin_chat_id()
+
+    # Формуємо зведення
+    age = data.get("age", "—")
+    role = data.get("role", "—")
+    name = data.get("name", "—")
+    contact = data.get("contact", "—")
+    experience = data.get("experience", "—")
+    schedule = data.get("schedule", "—")
+    start_ready = data.get("start_ready", "—")
+    questions = data.get("questions", [])
+    answers = data.get("answers", [])
+    links = data.get("portfolio_links", [])
+    photos = data.get("portfolio_photos", [])
+
+    username = message.from_user.username or "—"
+    user_id = message.from_user.id
+
+    qa_text_lines = []
+    for i, q in enumerate(questions):
+        a = answers[i] if i < len(answers) else "—"
+        qa_text_lines.append(f"{i+1}) {q}\nВідповідь: {a}")
+
+    links_text = "\n".join(links) if links else "—"
+    photos_count = len(photos)
+
+    summary = (
+        "🆕 Нова анкета\n"
+        "====================\n"
         f"Роль: {role}\n"
-        f"Ім'я: {data.get('name','')}\n"
-        f"Контакт: {data.get('contact','')}\n"
-        f"Досвід: {data.get('experience','')}\n"
-        f"Відповіді: {data.get('skills','')}\n"
-        f"Портфоліо (текст/посилання): {portfolio_text}\n"
-        f"Фото: {len(photos)} шт.\n"
-        f"Графік: {data.get('schedule','')}\n"
-        f"Готовність: {data.get('ready','')}\n"
+        f"Ім’я: {name}\n"
+        f"Вік: {age}\n"
+        f"Контакт: {contact}\n"
+        f"Telegram: @{username}\n"
+        f"user_id: {user_id}\n"
+        f"Досвід: {experience}\n"
+        "--------------------\n"
+        "Відповіді:\n"
+        + ("\n\n".join(qa_text_lines) if qa_text_lines else "—")
+        + "\n--------------------\n"
+        f"Портфоліо (посилання/текст): {links_text}\n"
+        f"Фото робіт: {photos_count}\n"
+        f"Графік: {schedule}\n"
+        f"Готовність старту: {start_ready}\n"
+        "===================="
     )
 
-    if message.from_user.username:
-        admin_text += f"TG: @{message.from_user.username}\n"
-    else:
-        admin_text += f"TG: (нема) user_id={message.from_user.id}\n"
+    # Відповідь кандидату
+    await message.answer("Дякую! Повідомлення отримано ✅")
 
     # Надсилання адміну
-    if ADMIN_CHAT_ID:
-        try:
-            await bot.send_message(ADMIN_CHAT_ID, admin_text)
-        except TelegramBadRequest:
-            pass
+    if admin_chat_id == 0:
+        await message.answer(
+            "⚠️ Адміністратор ще не налаштований.\n"
+            "Напишіть /setadmin у чаті з ботом (адміністратором стане цей чат)."
+        )
+        await state.clear()
+        return
 
-        # Надіслати фото (якщо є). Підпишемо перше фото кодом заявки.
+    try:
+        await bot.send_message(admin_chat_id, summary)
+
+        # якщо є фото — відправляємо медіагрупою (до 10)
         if photos:
-            for i, fid in enumerate(photos[:10]):  # ліміт 10 фото
-                try:
-                    caption = f"{app_id} — фото портфоліо ({i+1}/{min(len(photos),10)})" if i == 0 else ""
-                    await bot.send_photo(ADMIN_CHAT_ID, fid, caption=caption)
-                except TelegramBadRequest:
-                    pass
+            media = [InputMediaPhoto(media=pid) for pid in photos[:10]]
+            await bot.send_media_group(admin_chat_id, media)
 
-    await state.clear()
+    except Exception as e:
+        # Якщо адмін-чат недоступний — повідомляємо (щоб ви побачили причину)
+        await message.answer(f"⚠️ Не вдалося надіслати адміну: {e}\nСпробуйте /setadmin ще раз.")
+    finally:
+        await state.clear()
 
-# --- якщо люди пишуть без /start ---
-@dp.message()
-async def fallback(message: Message):
-    await message.answer("Щоб подати заявку — натисніть /start")
+
+# =========================
+# ЗАПУСК
+# =========================
 
 async def main():
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
+    import asyncio
     asyncio.run(main())
